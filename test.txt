@@ -1,0 +1,180 @@
+package main
+
+import (
+"fmt"
+"sort"
+"sync"
+"testing"
+"time"
+
+    "github.com/gorilla/websocket"
+
+)
+
+var (
+host = "ws://127.0.0.1"
+)
+
+type TestConfig struct {
+clientCount int
+wg \*sync.WaitGroup
+}
+
+type DialResult struct {
+clientNum int
+err error
+}
+
+type DialStats struct {
+expected int
+total int
+successes int
+failures int
+firstObservedFailureClient int
+firstObservedFailureErr string
+lowestFailedClient int
+highestSuccessfulClient int
+errorsByMessage map[string]int
+}
+
+func DialServer(clientNum int, wg \*sync.WaitGroup, results chan<- DialResult) {
+defer wg.Done()
+
+    // client
+    dialer := websocket.DefaultDialer
+
+    conn, _, err := dialer.Dial(fmt.Sprintf("%s%s", host, WSPort), nil)
+    if err != nil {
+    	results <- DialResult{clientNum: clientNum, err: err}
+    	return
+    }
+    results <- DialResult{clientNum: clientNum}
+
+    defer func() {
+    	conn.Close()
+    }()
+
+    time.Sleep(2 * time.Second)
+
+}
+
+func TrackDialResults(expected int, results <-chan DialResult) DialStats {
+stats := DialStats{
+expected: expected,
+errorsByMessage: map[string]int{},
+}
+progressEvery := 1000
+
+    for result := range results {
+    	stats.total++
+
+    	if result.err != nil {
+    		stats.failures++
+    		errMsg := result.err.Error()
+    		stats.errorsByMessage[errMsg]++
+
+    		if stats.firstObservedFailureClient == 0 {
+    			stats.firstObservedFailureClient = result.clientNum
+    			stats.firstObservedFailureErr = errMsg
+    		}
+    		if stats.lowestFailedClient == 0 || result.clientNum < stats.lowestFailedClient {
+    			stats.lowestFailedClient = result.clientNum
+    		}
+    	} else {
+    		stats.successes++
+    		if result.clientNum > stats.highestSuccessfulClient {
+    			stats.highestSuccessfulClient = result.clientNum
+    		}
+    	}
+
+    	if stats.total%progressEvery == 0 || stats.total == expected {
+    		fmt.Printf(
+    			"dial progress: total=%d/%d success=%d failure=%d lowest_failed=%s first_observed_failure=%s\n",
+    			stats.total,
+    			stats.expected,
+    			stats.successes,
+    			stats.failures,
+    			formatClientNum(stats.lowestFailedClient),
+    			formatClientNum(stats.firstObservedFailureClient),
+    		)
+    	}
+    }
+
+    return stats
+
+}
+
+func PrintDialSummary(stats DialStats) {
+fmt.Println("Dial summary:")
+fmt.Printf(" attempted: %d/%d\n", stats.total, stats.expected)
+fmt.Printf(" successes: %d\n", stats.successes)
+fmt.Printf(" failures: %d\n", stats.failures)
+fmt.Printf(" highest successful client number: %s\n", formatClientNum(stats.highestSuccessfulClient))
+fmt.Printf(" lowest failed client number: %s\n", formatClientNum(stats.lowestFailedClient))
+fmt.Printf(" first observed failure client number: %s\n", formatClientNum(stats.firstObservedFailureClient))
+if stats.firstObservedFailureErr != "" {
+fmt.Printf(" first observed failure error: %s\n", stats.firstObservedFailureErr)
+}
+
+    if len(stats.errorsByMessage) == 0 {
+    	return
+    }
+
+    fmt.Println("  failure breakdown:")
+    errMsgs := make([]string, 0, len(stats.errorsByMessage))
+    for errMsg := range stats.errorsByMessage {
+    	errMsgs = append(errMsgs, errMsg)
+    }
+    sort.Strings(errMsgs)
+
+    for _, errMsg := range errMsgs {
+    	fmt.Printf("    %d x %s\n", stats.errorsByMessage[errMsg], errMsg)
+    }
+
+}
+
+func formatClientNum(n int) string {
+if n == 0 {
+return "none"
+}
+return fmt.Sprintf("#%d", n)
+}
+
+func Test_Connection(t _testing.T) {
+// s := NewServer()
+go createWSServer()
+time.Sleep(1 _ time.Second)
+
+    tc := TestConfig{
+    	clientCount: 100_000,
+    	wg:          new(sync.WaitGroup),
+    }
+    tc.wg.Add(tc.clientCount)
+    results := make(chan DialResult, 1024)
+    statsDone := make(chan DialStats, 1)
+
+    go func() {
+    	statsDone <- TrackDialResults(tc.clientCount, results)
+    }()
+
+    for i := range tc.clientCount {
+    	go DialServer(i+1, tc.wg, results)
+    }
+
+    tc.wg.Wait()
+    close(results)
+    stats := <-statsDone
+    PrintDialSummary(stats)
+
+    if stats.failures > 0 {
+    	t.Fatalf(
+    		"dial failures: failures=%d first_observed=%s lowest_failed=%s",
+    		stats.failures,
+    		formatClientNum(stats.firstObservedFailureClient),
+    		formatClientNum(stats.lowestFailedClient),
+    	)
+    }
+    time.Sleep(1 * time.Second)
+    fmt.Println("Exiting test....")
+
+}
