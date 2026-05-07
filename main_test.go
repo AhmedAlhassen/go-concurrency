@@ -1,8 +1,11 @@
 package main
 
 import (
+	"context"
 	"fmt"
+	"log"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -14,57 +17,118 @@ var (
 )
 
 type TestConfig struct {
-	clientCount int
-	wg          *sync.WaitGroup
+	clientCount    int
+	wg             *sync.WaitGroup
+	brMsgCount     *atomic.Int64
+	targetMsgCount int
 }
 
-func DialServer(clientNum int, wg *sync.WaitGroup, failedAt chan<- int) {
-	defer wg.Done()
+type TestClient struct {
+	conn  *websocket.Conn
+	msgCH chan *ReqMsg
+	ctx   context.Context
+}
 
+func NewTestClien(conn *websocket.Conn, ctx context.Context) *TestClient {
+	return &TestClient{
+		conn:  conn,
+		msgCH: make(chan *ReqMsg, 64),
+		ctx:   ctx,
+	}
+}
+
+func (c *TestClient) writeLoop() {
+	for {
+		select {
+		case <-c.ctx.Done():
+			return
+		case msg := <-c.msgCH:
+			if err := c.conn.WriteJSON(msg); err != nil {
+				fmt.Printf("error sending msg %v\n", err)
+				return
+			}
+		}
+	}
+}
+
+func DialServer(tc *TestConfig) *websocket.Conn {
+	exit := make(chan struct{})
 	// client
 	dialer := websocket.DefaultDialer
 
 	conn, _, err := dialer.Dial(fmt.Sprintf("%s%s", host, WSPort), nil)
 	if err != nil {
-		select {
-		case failedAt <- clientNum:
-			fmt.Printf("first failed client was #%d: %v\n", clientNum, err)
-		default:
-		}
-		return
+		log.Fatal(err)
 	}
 
-	defer func() {
-		conn.Close()
+	go func() {
+		for {
+			time.Sleep(2 * time.Second)
+			if tc.targetMsgCount == int(tc.brMsgCount.Load()) {
+				close(exit)
+				return
+			}
+		}
 	}()
-	fmt.Printf("client #%d connected to the server %s\n", clientNum, conn.LocalAddr().String())
 
-	time.Sleep(2 * time.Second)
+	go func() {
+		<-exit
+		conn.Close()
+		tc.wg.Done()
+	}()
+	// time.Sleep(2 * time.Second)
 
+	go func() {
+		for {
+			_, b, err := conn.ReadMessage()
+			if err != nil {
+				return
+			}
+
+			if len(b) > 0 {
+				tc.brMsgCount.Add(1)
+			}
+		}
+	}()
+	return conn
 }
 
 func Test_Connection(t *testing.T) {
 	// s := NewServer()
 	go createWSServer()
+	ctx, cancel := context.WithCancel(context.Background())
+
 	time.Sleep(1 * time.Second)
+	clientCount := 500
+	brCount := 100
 
 	tc := TestConfig{
-		clientCount: 5,
-		wg:          new(sync.WaitGroup),
+		clientCount:    clientCount,
+		wg:             new(sync.WaitGroup),
+		brMsgCount:     new(atomic.Int64),
+		targetMsgCount: clientCount * brCount,
 	}
-	tc.wg.Add(tc.clientCount)
-	failedAt := make(chan int, 1)
+	tc.wg.Add(tc.clientCount + 1)
 
-	for i := range tc.clientCount {
-		go DialServer(i+1, tc.wg, failedAt)
+	brConn := DialServer(&tc)
+	brClient := NewTestClien(brConn, ctx)
+	go brClient.writeLoop()
+
+	for range tc.clientCount {
+		go DialServer(&tc)
+	}
+
+	time.Sleep(1 * time.Second)
+
+	for range brCount {
+		msg := NewReqMsg()
+		msg.MsgType = MsgType_Broadcast
+		msg.Data = "hello from tests"
+		brClient.msgCH <- msg
 	}
 
 	tc.wg.Wait()
-	select {
-	case n := <-failedAt:
-		t.Fatalf("first client failure happened at client #%d", n)
-	default:
-	}
-	time.Sleep(1 * time.Second)
+	cancel()
+
 	fmt.Println("Exiting test....")
 }
